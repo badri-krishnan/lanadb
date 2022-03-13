@@ -34,6 +34,7 @@ pub struct WAL{
 }
 
 impl WAL{
+    //Create New WAL
     pub fn new(dir: &Path) -> io::Result<WAL>{
         let timestamp = SystemTime::now().
             duration_since(UNIX_EPOCH).
@@ -44,6 +45,8 @@ impl WAL{
 
         Ok(WAL{wal_path, wal_file})
     }
+
+    //Create WAL from path
     pub fn from_path(path: &Path) -> io::Result<WAL>{
         let wal_file = OpenOptions::new().append(true).create(true).open(&path)?;
         let wal_file = BufWriter::new(wal_file);
@@ -53,7 +56,8 @@ impl WAL{
             wal_file
         })
     }
-
+    
+    //Set Records in the WAL
     pub fn set(&mut self, key:&[u8], value:&[u8], timestamp:u128) ->io::Result<()>{
         //Key size write buffer
         self.wal_file.write_all(&key.len().to_le_bytes())?;
@@ -72,6 +76,8 @@ impl WAL{
         Ok(())
 
     }
+    
+    //Delete Record in the WAL
     pub fn delete(&mut self, key:&[u8], timestamp:u128) -> io::Result<()>{
         //Key size write buffer
         self.wal_file.write_all(&key.len().to_le_bytes())?;
@@ -131,7 +137,6 @@ impl WAL{
         wal_files.into_iter().for_each(|wf| remove_file(wf).unwrap());
         Ok((new_wal, recovery_mem_table))
     }
-
 }
 
 impl IntoIterator for WAL {
@@ -142,4 +147,196 @@ impl IntoIterator for WAL {
     fn into_iter(self) -> WALRecordIterator {
         WALRecordIterator::new(self.wal_path).unwrap()
     }
-  }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::wal::{WAL, self};
+    use rand::Rng;
+    use std::fs::{create_dir, remove_dir_all};
+    use std::fs::{metadata, File, OpenOptions};
+    use std::io::prelude::*;
+    use std::io::BufReader;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    
+    //Helper method to validate WAL Record Block Format and Value
+    fn validate_wal_record(reader: &mut BufReader<File>,key: &[u8], value: Option<&[u8]>,timestamp: u128,deleted: bool){
+        let mut len_buffer = [0;8];
+        reader.read_exact(&mut len_buffer).unwrap();
+        
+        //Read first buffer 
+        let wal_key_len = usize::from_le_bytes(len_buffer);
+        assert_eq!(wal_key_len, key.len());
+
+        let mut tombstone_buf = [0;1];
+        reader.read_exact(&mut tombstone_buf).unwrap();
+        let record_deleted = tombstone_buf[0] != 0;
+        println!("record deleted value : {}", record_deleted);
+        assert_eq!(record_deleted, deleted);
+
+        if deleted {
+            let mut wal_key = vec![0;wal_key_len];
+            reader.read_exact(&mut wal_key).unwrap();
+            assert_eq!(wal_key, key);
+        } else {
+            reader.read_exact(&mut len_buffer).unwrap();
+            let wal_value_len = usize::from_le_bytes(len_buffer);
+            assert_eq!(wal_value_len, value.unwrap().len());
+
+            let mut wal_key = vec![0;wal_key_len];
+            reader.read_exact(&mut wal_key).unwrap();
+            assert_eq!(wal_key, key);
+
+            let mut wal_value = vec![0;wal_value_len];
+            reader.read_exact(&mut wal_value).unwrap();
+            assert_eq!(wal_value, value.unwrap())
+        }
+        let mut timestamp_buffer = [0; 16];
+        reader.read_exact(&mut timestamp_buffer).unwrap();
+        let wal_timestamp = u128::from_le_bytes(timestamp_buffer);
+        assert_eq!(wal_timestamp, timestamp);
+    }
+
+    #[test]
+    fn test_write_one() {
+        let mut rng = rand::thread_rng();
+        let dir = PathBuf::from(format!("./{}/", rng.gen::<u32>()));
+        create_dir(&dir).unwrap();
+    
+        let timestamp = SystemTime::now()
+          .duration_since(UNIX_EPOCH)
+          .unwrap()
+          .as_micros();
+    
+        let mut wal = WAL::new(&dir).unwrap();
+        wal.set(b"Badri", b"Badri Krishnan", timestamp).unwrap();
+        wal.flush().unwrap();
+    
+        let wal_file = OpenOptions::new().read(true).open(&wal.wal_path).unwrap();
+        let mut reader = BufReader::new(wal_file);
+    
+        validate_wal_record(
+          &mut reader,
+          b"Badri",
+          Some(b"Badri Krishnan"),
+          timestamp,
+          false,
+        );
+    
+        remove_dir_all(&dir).unwrap();
+    }
+    
+    #[test]
+    fn test_write_many_records() {
+        let mut rng = rand::thread_rng();
+        let dir = PathBuf::from(format!("./{}/", rng.gen::<u32>()));
+        println!("HEllo : {}",dir.to_str().unwrap());
+        create_dir(&dir).unwrap();
+
+        let timestamp = SystemTime::now()
+          .duration_since(UNIX_EPOCH)
+          .unwrap()
+          .as_micros();
+        
+        let records: Vec<(&[u8], Option<&[u8]>)> = vec![
+            (b"Car", Some(b"Garage")),
+            (b"Bike", Some(b"Bike Rack")),
+            (b"Pedestrian", Some(b"Pedastrian Walkway")),
+        ];
+        let mut wal = WAL::new(&dir).unwrap();
+        for record in records.iter(){
+            wal.set(record.0, record.1.unwrap(), timestamp);
+        }
+        wal.flush().unwrap();
+        let wal_file = OpenOptions::new().read(true).open(&wal.wal_path).unwrap();
+        let mut reader = BufReader::new(wal_file);
+        for record in records.iter(){
+            validate_wal_record(&mut reader, record.0, record.1, timestamp, false);
+        }
+
+        remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn test_write_and_delete() {
+        let mut rng = rand::thread_rng();
+        let dir = PathBuf::from(format!("./{}/", rng.gen::<u32>()));
+        println!("HEllo : {}",dir.to_str().unwrap());
+        create_dir(&dir).unwrap();
+
+        let timestamp = SystemTime::now()
+          .duration_since(UNIX_EPOCH)
+          .unwrap()
+          .as_micros();
+        
+        let records: Vec<(&[u8], Option<&[u8]>)> = vec![
+            (b"Car", Some(b"Garage")),
+            (b"Bike", Some(b"Bike Rack")),
+            (b"Pedestrian", Some(b"Pedastrian Walkway")),
+        ];
+        let mut wal = WAL::new(&dir).unwrap();
+        for record in records.iter(){
+            wal.set(record.0, record.1.unwrap(), timestamp);
+        }
+        for record in records.iter(){
+            wal.delete(record.0, timestamp);
+        }
+        wal.flush().unwrap();
+        let wal_file = OpenOptions::new().read(true).open(&wal.wal_path).unwrap();
+        let mut reader = BufReader::new(wal_file);
+        for record in records.iter() {
+            validate_wal_record(&mut reader, record.0, record.1, timestamp, false);
+        }
+        for record in records.iter() {
+            validate_wal_record(&mut reader, record.0, None, timestamp, true);
+        }
+        remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn test_read_wal_none() {
+        let mut rng = rand::thread_rng();
+        let dir = PathBuf::from(format!("./{}/", rng.gen::<u32>()));
+        create_dir(&dir).unwrap();
+
+        let (new_wal, new_mem_table) = WAL::load_mem_table_from_dir(&dir).unwrap();
+        assert_eq!(new_mem_table.len(), 0);
+
+        let m = metadata(new_wal.wal_path).unwrap();
+        assert_eq!(m.len(), 0);
+
+        remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_read_wal_one(){
+        let mut rng = rand::thread_rng();
+        let dir = PathBuf::from(format!("./{}/", rng.gen::<u32>()));
+        create_dir(&dir).unwrap();    
+
+        let records: Vec<(&[u8], Option<&[u8]>)> = vec![
+            (b"Car", Some(b"Garage")),
+            (b"Bike", Some(b"Bike Rack")),
+            (b"Pedestrian", Some(b"Pedastrian Walkway")),
+        ];
+        let mut wal = WAL::new(&dir).unwrap();
+        for (time, record) in records.iter().enumerate(){
+            wal.set(record.0,record.1.unwrap(), time as u128).unwrap();
+        }
+        wal.flush().unwrap();
+        let (new_wal, mut recovered_table) = WAL::load_mem_table_from_dir(&dir).unwrap();
+        
+        let file = OpenOptions::new().read(true).open(&new_wal.wal_path).unwrap();
+        let mut reader = BufReader::new(file);
+
+        for (time, record) in records.iter().enumerate(){
+            validate_wal_record(&mut reader, record.0, record.1, time as u128, false);
+            let record_from_mem_table = recovered_table.get(record.0).unwrap();
+            assert_eq!(record_from_mem_table.key, record.0);
+            assert_eq!(record_from_mem_table.value.as_ref().unwrap().as_slice(), record.1.unwrap());
+            assert_eq!(record_from_mem_table.timestamp, time as u128);
+        }
+
+        remove_dir_all(&dir).unwrap();
+
+    }
+}
